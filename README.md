@@ -10,33 +10,43 @@ A **PyTorch implementation** of the VLM-PAR architecture described in [arXiv:251
 
 ## Approach
 
-VLM-PAR treats pedestrian attribute recognition as a **vision-language alignment** problem. It uses a pretrained Vision-Language Model ([SigLIP 2](https://arxiv.org/abs/2502.14786)) as a frozen feature extractor, and learns **per-attribute independent Cross-Attention** modules to map visual features to attribute predictions.
+VLM-PAR treats pedestrian attribute recognition as a **vision-language alignment** problem using the paper's original Cross-Attention direction: **Q=Image, K/V=Text**.
 
-Key insight: **a frozen VLM already understands clothing, accessories, and body characteristics** — we only need to teach it how to read those features for specific attributes.
+A pretrained Vision-Language Model ([SigLIP 2](https://arxiv.org/abs/2502.14786)) serves as a frozen feature extractor. For each attribute, image patch tokens query against cached text embeddings through independent Cross-Attention modules — allowing each attribute to attend to its relevant image regions.
 
-### Architecture
+Key insight: **each image patch asks "how relevant am I to this attribute description?"** — hat patches attend to "a person wearing a hat", torso patches attend to "a person wearing black upper clothing".
+
+### Architecture (Paper Section 3.4)
 
 ```
-Image (224×224)
-    ↓
+Image (224x224)
+    |
 SigLIP 2 ViT-B/16 (frozen, not trained)
-    ↓ 14×14 = 196 patch tokens [B, 196, 768]
-    ↓
-38 Independent Cross-Attention Modules (trained)
-    ├── CA #1:  "Female?"      → query attends to patches → 0.92 → Female
-    ├── CA #2:  "Hat?"         → focuses on head region   → 0.87 → Wearing
-    ├── CA #3:  "Glasses?"     → focuses on face region   → 0.12 → Not wearing
-    ├── CA #4:  "T-shirt?"     → focuses on upper body    → 0.83 → Yes (short sleeve)
-    ├── ...
-    ├── CA #13: "Upper black?" → focuses on torso color   → 0.08 → No
-    ├── CA #14: "Upper white?" → focuses on torso color   → 0.91 → Yes
-    ├── ...
-    └── CA #38: "Lower mixed?" → focuses on lower body    → 0.05 → No
-    ↓
-Result: Male, Hat, White short-sleeve, Black long-pants
+    | 14x14 = 196 patch tokens [B, 196, 768]
+    |
+x84 Independent Cross-Attention Modules (trained)
+    |
+    |   Q = Image patch tokens [B, 196, 768]    <-- Image asks
+    |   K = Text embedding [T, 768]              <-- Attribute description (cached)
+    |   V = Text embedding [T, 768]              <-- Attribute description (cached)
+    |
+    |   head_h = softmax(Q . K^T / sqrt(96)) . V    (8 heads, d_k=96)
+    |   h = LayerNorm(MultiHead + Residual)
+    |   h = LayerNorm(FFN(h) + h)
+    |   GAP -> Linear(768->1) -> logit
+    |
+    +-- CA #1:  "Female?"            -> attends to full body   -> 0.92
+    +-- CA #13: "Hat?"               -> attends to head region -> 0.87
+    +-- CA #55: "Upper black?"       -> attends to torso color -> 0.08
+    +-- CA #56: "Upper white?"       -> attends to torso color -> 0.91
+    +-- CA #67: "Lower black?"       -> attends to legs color  -> 0.85
+    +-- ...
+    +-- CA #84: "Shoes mixed color?" -> attends to feet        -> 0.05
+    |
+Result: Male, Hat, White short-sleeve, Black long-pants, Black sport shoes
 ```
 
-Each attribute has its own **learnable query token** that learns to attend to the relevant image patches through Cross-Attention.
+Text embeddings are computed **once at server startup** and cached as K/V buffers — zero text encoder cost at inference time.
 
 ### Based On
 
@@ -49,36 +59,31 @@ Each attribute has its own **learnable query token** that learns to attend to th
 
 ### Paper vs Our Implementation
 
-The core algorithm follows the paper as closely as possible. Two changes were made to adapt for **real-world person feature search**:
-
 | Aspect | Paper | Ours | Why |
 |--------|-------|------|-----|
-| Cross-Attention | Per-attribute independent | **Per-attribute independent** (same) | Following the paper's design |
-| Attributes | 26 (PA-100K) | **38** (RAP v2 selected) | PA-100K has **no color attributes**. Clothing color (upper 12 colors, lower 8 colors) is important for practical use. Selected 38 attributes from RAP v2's 92 for person identification. |
-| Dataset | PA-100K (100K images, street photos) | **RAP v2** (41K images, **CCTV**) | PA-100K consists of eye-level pedestrian photos. Our system operates on **elevated CCTV cameras**. RAP v2 was captured from actual CCTV, matching the deployment environment. |
-| Text init | SigLIP text encoder | **SigLIP text encoder** (same) | Following paper — initializes query tokens with text like "a person wearing a hat" to provide semantic prior knowledge. |
-| Code | Not released | **This repository** | Paper (arXiv:2512.22217) does not provide source code. Independently implemented based on the architecture description. |
+| Cross-Attention direction | Q=Image, K/V=Text | **Q=Image, K/V=Text** (same) | Faithful to paper Section 3.4. Each patch queries against text description. |
+| Text encoder at inference | Runs every time | **Cached once** (cost=0) | 84 attribute prompts are fixed. Cache text embeddings at startup. |
+| Attributes | 26 (PA-100K) | **84** (RAP v2, excl. actions) | PA-100K has **no color attributes**. We use RAP v2's full attribute set minus 8 action attributes for practical surveillance use. |
+| Dataset | PA-100K (100K, street photos) | **RAP v2** (41K, **CCTV**) | RAP v2 was captured from actual CCTV cameras, matching deployment environment. |
+| Loss function | CE + Focal + Label Smoothing | **Focal + Label Smoothing + pos_weight** | Following paper Section 3.5 for class imbalance handling. |
 
-### Why This Design
+## 84 Attributes
 
-**Goal**: Classify pedestrian attributes (clothing type, color, accessories) from surveillance camera images with high accuracy.
+RAP v2 full 92 attributes minus 8 action attributes = **84 attributes**:
 
-**Why VLM-PAR**: The paper showed that a frozen SigLIP 2 backbone already understands clothing attributes — only lightweight attention heads need training. Fast training (~6 hours), small VRAM (~1.3GB), high accuracy (mA 88%).
-
-**Why RAP v2 over PA-100K**: PA-100K has 26 attributes but **zero color attributes**. Clothing color is important for practical pedestrian attribute recognition. RAP v2 provides 12 upper-body colors + 8 lower-body colors, and its images come from real surveillance cameras.
-
-## Results
-
-### RAP v2 Test Set — mA 88.14%
-
-| Group | Attributes | mA |
-|-------|-----------|-----|
-| Gender | female | **95.9%** |
-| Head | hat, glasses | **87.3%** |
-| Upper type | shirt, sweater, vest, t-shirt, cotton, jacket, suit, tight, short-sleeve | 85.0% |
-| Upper color | black, white, gray, red, green, blue, yellow, brown, purple, pink, orange, mixed | **89.8%** |
-| Lower type | long-trousers, skirt, short-skirt, dress, jeans, tight-trousers | **91.6%** |
-| Lower color | black, white, gray, red, green, blue, yellow, mixed | **85.9%** |
+| Category | Count | Attributes |
+|----------|:-----:|-----------|
+| **Personal** | 9 | gender, age(3), body type(3), role(2) |
+| **Head/Accessories** | 6 | bald, long hair, black hair, hat, glasses, muffler |
+| **Upper type** | 9 | shirt, sweater, vest, t-shirt, cotton, jacket, suit, tight, short-sleeve |
+| **Lower type** | 6 | long-trousers, skirt, short-skirt, dress, jeans, tight-trousers |
+| **Shoes type** | 5 | leather, sport, boots, cloth, casual |
+| **Attachments** | 8 | backpack, shoulder bag, handbag, box, plastic bag, paper bag, trunk, other |
+| **Direction** | 4 | front, back, left, right |
+| **Occlusion** | 8 | left, right, up, down, environment, attachment, person, other |
+| **Upper color** | 12 | black, white, gray, red, green, blue, yellow, brown, purple, pink, orange, mixed |
+| **Lower color** | 8 | black, white, gray, red, green, blue, yellow, mixed |
+| **Shoes color** | 9 | black, white, gray, red, green, blue, yellow, brown, mixed |
 
 ## Quick Start
 
@@ -101,49 +106,45 @@ python train.py \
   --batch-size 16 \
   --lr 3e-4 \
   --device cuda:0 \
-  --save-dir checkpoints/vlmpar
+  --save-dir checkpoints/vlmpar_v3
 ```
-
-~6 hours on a single GPU. Only the 38 Cross-Attention heads (~186M params) are trained — SigLIP 2 stays frozen.
 
 ### 4. Inference
 
 ```python
 import torch
-from vlmpar_model import VLMPARWrapper, ATTR_NAMES
+from vlmpar_model import VLMPARv3Wrapper, _parse_attributes
 
-model = VLMPARWrapper(device='cuda:0')
-model.par_head.load_state_dict(torch.load('vlmpar_best.pth')['model_state_dict'])
+model = VLMPARv3Wrapper(device='cuda:0')
+checkpoint = torch.load('checkpoints/vlmpar_v3/vlmpar_v3_best.pth', weights_only=False)
+model.par_head.load_state_dict(checkpoint['model_state_dict'])
 
 results = model.classify(tensor)
 print(results[0])
-# {'gender': 'male', 'hat': True, 'upper_type': 'short_sleeve',
-#  'upper_color': 'white', 'lower_type': 'long_pants', 'lower_color': 'black'}
+# {'gender': 'male', 'age': 'young', 'hat': True, 'glasses': False,
+#  'upper_type': 'short_sleeve', 'upper_color': 'black',
+#  'lower_type': 'short_pants', 'lower_color': 'black',
+#  'shoes_type': 'sport', 'shoes_color': 'white',
+#  'backpack': True, 'direction': 'front'}
 ```
 
-## 38 Attributes
+Or use the CLI:
 
-Selected for **person feature reference**:
-
-| Category | Count | Attributes |
-|----------|-------|-----------|
-| Gender | 1 | female |
-| Head | 2 | hat, glasses |
-| Upper type | 9 | shirt, sweater, vest, t-shirt, cotton, jacket, suit, tight, short-sleeve |
-| Upper color | 12 | black, white, gray, red, green, blue, yellow, brown, purple, pink, orange, mixed |
-| Lower type | 6 | long-trousers, skirt, short-skirt, dress, jeans, tight-trousers |
-| Lower color | 8 | black, white, gray, red, green, blue, yellow, mixed |
+```bash
+python inference.py --image person.jpg --checkpoint checkpoints/vlmpar_v3/vlmpar_v3_best.pth
+```
 
 ## Model Specs
 
 | | |
 |---|---|
-| Architecture | SigLIP 2 ViT-B/16 (frozen) + 38 Independent Cross-Attention |
-| Trainable params | ~186M |
-| Total params | ~272M (86M frozen SigLIP) |
-| Input | 224 × 224 RGB |
-| Output | 38 probabilities (sigmoid) |
-| Best mA | **88.14%** (RAP v2) |
+| Architecture | SigLIP 2 ViT-B/16 (frozen) + 84 Independent Cross-Attention |
+| CA direction | **Q=Image patches, K/V=Text embeddings** (paper faithful) |
+| Trainable params | ~130M (84 CA modules) |
+| Total params | ~216M (86M frozen SigLIP) |
+| Input | 224 x 224 RGB |
+| Output | 84 probabilities (sigmoid) |
+| Loss | Focal Loss (gamma=2.0) + Label Smoothing (eps=0.05) + pos_weight |
 | Framework | PyTorch + open_clip |
 
 ## License

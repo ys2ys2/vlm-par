@@ -1,53 +1,34 @@
 #!/usr/bin/env python3
 """
-VLM-PAR Inference Example
+VLM-PAR v3 Inference — 84 Attributes (Paper Structure: Q=Image, K/V=Text)
 
 Usage:
     python inference.py --image person.jpg
-    python inference.py --image person.jpg --checkpoint checkpoints/vlmpar_best.pth
+    python inference.py --image person.jpg --checkpoint checkpoints/vlmpar_v3/vlmpar_v3_best.pth
 """
 
 import argparse
 import torch
 import numpy as np
 from PIL import Image
-from vlmpar_model import VLMPARWrapper, PA100K_ATTRS
-
-
-ATTR_DISPLAY = {
-    'female': ('Gender', 'Female', 'Male'),
-    'age_over_60': ('Age', 'Over 60', None),
-    'age_18_60': ('Age', '18-60', None),
-    'age_less_18': ('Age', 'Under 18', None),
-    'hat': ('Hat', 'Yes', 'No'),
-    'glasses': ('Glasses', 'Yes', 'No'),
-    'short_sleeve': ('Upper', 'Short sleeve', None),
-    'long_sleeve': ('Upper', 'Long sleeve', None),
-    'trousers': ('Lower', 'Trousers', None),
-    'shorts': ('Lower', 'Shorts', None),
-    'skirt_dress': ('Lower', 'Skirt/Dress', None),
-    'backpack': ('Bag', 'Backpack', None),
-    'shoulder_bag': ('Bag', 'Shoulder bag', None),
-    'hand_bag': ('Bag', 'Handbag', None),
-}
+from vlmpar_model import VLMPARv3Wrapper, ATTR_NAMES, ATTR_GROUPS, _parse_attributes
 
 
 def main():
-    parser = argparse.ArgumentParser(description='VLM-PAR Inference')
+    parser = argparse.ArgumentParser(description='VLM-PAR v3 Inference (84 attrs)')
     parser.add_argument('--image', type=str, required=True, help='Path to pedestrian image')
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to trained .pth file')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--threshold', type=float, default=0.5)
     args = parser.parse_args()
 
-    # Load model
-    print("Loading VLM-PAR model...")
-    model = VLMPARWrapper(device=args.device)
+    print("Loading VLM-PAR v3 (84 attrs, Q=Image, K/V=Text)...")
+    model = VLMPARv3Wrapper(device=args.device)
 
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location=args.device)
+        checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
         model.par_head.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded checkpoint: {args.checkpoint} (mA={checkpoint.get('mA', '?')}%)")
+        print(f"Loaded: {args.checkpoint} (mA={checkpoint.get('mA', '?')}%, F1={checkpoint.get('f1', '?')}%)")
     else:
         print("Warning: No checkpoint loaded. Output will be random (untrained model).")
 
@@ -55,35 +36,51 @@ def main():
 
     # Load and preprocess image
     img = Image.open(args.image).convert('RGB')
-    img_tensor = model.preprocess(img).unsqueeze(0).to(args.device)
+    from torchvision import transforms
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5] * 3, [0.5] * 3),
+    ])
+    img_tensor = transform(img).unsqueeze(0).to(args.device)
 
     # Inference
     with torch.no_grad():
         logits = model(img_tensor)
         probs = torch.sigmoid(logits).cpu().numpy()[0]
 
-    # Display results
-    print(f"\n{'='*40}")
+    # Parse structured attributes
+    attrs = _parse_attributes(probs, args.threshold)
+
+    # Display
+    print(f"\n{'='*50}")
     print(f"Image: {args.image}")
-    print(f"{'='*40}")
+    print(f"{'='*50}")
+    print(f"  Gender:      {attrs['gender']}")
+    print(f"  Age:         {attrs['age']}")
+    print(f"  Body type:   {attrs['body_type']}")
+    print(f"  Hat:         {attrs['hat']}")
+    print(f"  Glasses:     {attrs['glasses']}")
+    print(f"  Upper:       {attrs['upper_type']} ({attrs.get('upper_type_detail', '')})")
+    print(f"  Upper color: {attrs['upper_color']}")
+    print(f"  Lower:       {attrs['lower_type']} ({attrs.get('lower_type_detail', '')})")
+    print(f"  Lower color: {attrs['lower_color']}")
+    print(f"  Shoes:       {attrs['shoes_type']}, {attrs['shoes_color']}")
+    print(f"  Direction:   {attrs['direction']}")
+    print(f"  Backpack:    {attrs['backpack']}")
+    print(f"  Shoulder bag:{attrs['shoulder_bag']}")
+    print(f"  Hand bag:    {attrs['hand_bag']}")
 
-    for attr, prob in zip(PA100K_ATTRS, probs):
-        if attr in ATTR_DISPLAY:
-            category, pos_label, neg_label = ATTR_DISPLAY[attr]
-            if prob > args.threshold:
-                print(f"  [{category:8s}] {pos_label:15s} ({prob:.1%})")
-            elif neg_label and prob <= args.threshold:
-                # Only show negative for binary attrs like gender
-                if attr == 'female':
-                    print(f"  [{category:8s}] {neg_label:15s} ({1-prob:.1%})")
-
-    # All attributes (verbose)
-    print(f"\n{'='*40}")
-    print("All attributes:")
-    print(f"{'='*40}")
-    for attr, prob in zip(PA100K_ATTRS, probs):
-        marker = "*" if prob > args.threshold else " "
-        print(f"  {marker} {attr:20s} {prob:.3f}")
+    # All 84 attributes with probabilities
+    print(f"\n{'='*50}")
+    print(f"All {len(ATTR_NAMES)} attributes:")
+    print(f"{'='*50}")
+    for group_name, indices in ATTR_GROUPS.items():
+        print(f"\n  [{group_name}]")
+        for idx in indices:
+            p = probs[idx]
+            marker = "*" if p > args.threshold else " "
+            print(f"    {marker} {ATTR_NAMES[idx]:25s} {p:.3f}")
 
 
 if __name__ == '__main__':
